@@ -19,6 +19,8 @@ pub fn build(b: *std.Build) void {
 
     kernel.setLinkerScript(b.path("kernel.ld"));
 
+    b.installArtifact(kernel);
+
     const qemu = b.addSystemCommand(&.{"qemu-system-riscv32"});
     qemu.addArgs(&.{ "-machine", "virt" });
     qemu.addArgs(&.{ "-bios", "default" });
@@ -31,6 +33,4 @@ pub fn build(b: *std.Build) void {
 
     const run = b.step("run", "boot the os within qemu");
     run.dependOn(&qemu.step);
-
-    b.default_step = run;
 }

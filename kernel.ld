@@ -17,7 +17,7 @@ SECTIONS {
   }
 
   .bss : ALIGN(4) {
-    __bss_start = .;
+    __bss = .;
     *(.bss .bss.* .sbss .sbss.*);
     __bss_end = .;
   }
@@ -25,4 +25,9 @@ SECTIONS {
   . = ALIGN(4);
   . += 128 * 1024;
   __stack_top = .;
+
+  . = ALIGN(4096);
+  __free_ram = .;
+  . += 64 * 1024 * 1024;
+  __free_ram_end = .;
 }
