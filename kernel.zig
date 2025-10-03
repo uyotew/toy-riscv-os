@@ -58,8 +58,8 @@ fn yield() void {
     if (current_proc == next) return;
     const prev: *Process = current_proc;
     current_proc = next;
-    switchContext(&prev.sp, &next.sp);
     for (0..30_000_000) |_| asm volatile ("nop");
+    switchContext(&prev.sp, &next.sp);
 }
 
 fn proc1Entry() noreturn {
@@ -100,11 +100,14 @@ const Process = struct {
     }
 };
 
-// this can't be callconv(.naked) because of the arguments?
-// and also cannot be noreturn.? for some reason.
-// gets stuck if inlined..
+// this can't be callconv(.naked) because naked fns cannot be called?
+// and also cannot have noreturn.? for some reason.
+// only works in ReleaseSmall
+// halts in ReleaseFast and ReleaseSafe
+// trap scause=1 in Debug
+// if noinline is added ReleaseFast and ReleaseSafe works
 // function prologue and epilogue gets added, but they don't affect correctness
-noinline fn switchContext(prev_sp: *usize, next_sp: *usize) void {
+fn switchContext(prev_sp: *usize, next_sp: *usize) void {
     asm volatile (
         \\addi sp, sp, -4 * 13
         \\sw ra, 4 * 0(sp)
