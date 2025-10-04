@@ -56,11 +56,15 @@ fn yield() void {
         if (proc.state == .runnable and proc.pid != 0) break proc;
     } else return;
     if (current_proc == next) return;
+
+    asm volatile ("csrw sscratch, %[sscratch]"
+        :
+        : [sscratch] "r" (@intFromPtr(&next.stack) + next.stack.len),
+    );
+
     const prev: *Process = current_proc;
     current_proc = next;
 
-    // i assume there are potential bugs here
-    // seems to work in all optimize modes for now..
     asm volatile (
         \\mv a0, %[prev_sp]
         \\mv a1, %[next_sp]
@@ -72,18 +76,16 @@ fn yield() void {
         : .{ .x1 = true }); // x1 is ra, clobbered by jal
 }
 
-fn proc1Entry() noreturn {
-    debug.print("proc 1 starting\n", .{});
+fn proc1Entry() void {
     while (true) {
-        debug.print("1\n", .{});
         yield();
+        debug.print("1", .{});
     }
 }
-fn proc2Entry() noreturn {
-    debug.print("proc 2 starting\n", .{});
+fn proc2Entry() void {
     while (true) {
-        debug.print("2\n", .{});
         yield();
+        debug.print("2", .{});
     }
 }
 
@@ -150,7 +152,7 @@ fn switchContext() callconv(.naked) void {
 
 fn enterKernel() align(4) callconv(.naked) void {
     asm volatile (
-        \\csrw sscratch, sp
+        \\csrrw sp, sscratch, sp
         \\addi sp, sp, -4 * 31
         \\sw ra, 4 * 0(sp)
         \\sw gp, 4 * 1(sp)
@@ -185,6 +187,9 @@ fn enterKernel() align(4) callconv(.naked) void {
         \\
         \\csrr a0, sscratch
         \\sw a0, 4 * 30(sp)
+        \\
+        \\addi a0, sp, 4 * 31
+        \\csrw sscratch, a0
         \\
         \\mv a0, sp
         \\call %[handleTrap]
