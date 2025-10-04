@@ -58,21 +58,32 @@ fn yield() void {
     if (current_proc == next) return;
     const prev: *Process = current_proc;
     current_proc = next;
-    for (0..30_000_000) |_| asm volatile ("nop");
-    switchContext(&prev.sp, &next.sp);
+
+    // doesn't work in ReleaseSmall
+    // a ret instruction is added right after this,
+    // and the ra register points to it, creating an infinite loop
+    asm volatile (
+        \\mv a0, %[prev_sp]
+        \\mv a1, %[next_sp]
+        \\jal %[switchContext]
+        :
+        : [prev_sp] "r" (&prev.sp),
+          [next_sp] "r" (&next.sp),
+          [switchContext] "X" (&switchContext),
+    );
 }
 
 fn proc1Entry() noreturn {
     debug.print("proc 1 starting\n", .{});
     while (true) {
-        debug.print("1", .{});
+        debug.print("1\n", .{});
         yield();
     }
 }
 fn proc2Entry() noreturn {
     debug.print("proc 2 starting\n", .{});
     while (true) {
-        debug.print("2", .{});
+        debug.print("2\n", .{});
         yield();
     }
 }
@@ -84,8 +95,8 @@ const Process = struct {
     stack: [8192]u8 = undefined,
 
     fn create(pc: usize) *Process {
-        const idx = for (&processes, 0..) |p, i| {
-            if (p.state == .unused) break i;
+        const idx = for (0..processes.len) |i| {
+            if (processes[i].state == .unused) break i;
         } else @panic("no unused process slots");
 
         const proc = &processes[idx];
@@ -100,14 +111,7 @@ const Process = struct {
     }
 };
 
-// this can't be callconv(.naked) because naked fns cannot be called?
-// and also cannot have noreturn.? for some reason.
-// only works in ReleaseSmall
-// halts in ReleaseFast and ReleaseSafe
-// trap scause=1 in Debug
-// if noinline is added ReleaseFast and ReleaseSafe works
-// function prologue and epilogue gets added, but they don't affect correctness
-fn switchContext(prev_sp: *usize, next_sp: *usize) void {
+fn switchContext() callconv(.naked) noreturn {
     asm volatile (
         \\addi sp, sp, -4 * 13
         \\sw ra, 4 * 0(sp)
@@ -124,8 +128,8 @@ fn switchContext(prev_sp: *usize, next_sp: *usize) void {
         \\sw s10, 4 * 11(sp)
         \\sw s11, 4 * 12(sp)
         \\
-        \\sw sp, (%[prev_sp])
-        \\lw sp, (%[next_sp])
+        \\sw sp, (a0)
+        \\lw sp, (a1)
         \\
         \\lw ra, 4 * 0(sp)
         \\lw s0, 4 * 1(sp)
@@ -142,9 +146,6 @@ fn switchContext(prev_sp: *usize, next_sp: *usize) void {
         \\lw s11, 4 * 12(sp)
         \\addi sp, sp, 4 * 13
         \\ret
-        :
-        : [prev_sp] "{a0}" (prev_sp),
-          [next_sp] "{a1}" (next_sp),
     );
 }
 
