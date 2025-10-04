@@ -14,6 +14,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .stack_protector = false,
+            .strip = false,
         }),
     });
 
@@ -25,10 +26,9 @@ pub fn build(b: *std.Build) void {
     const qemu = b.addSystemCommand(&.{"qemu-system-riscv32"});
     qemu.addArgs(&.{ "-machine", "virt" });
     qemu.addArgs(&.{ "-bios", "default" });
-    qemu.addArg("-nographic");
     qemu.addArgs(&.{ "-serial", "mon:stdio" });
+    qemu.addArg("-nographic");
     qemu.addArg("--no-reboot");
-
     qemu.addArg("-kernel");
     qemu.addArtifactArg(kernel);
 

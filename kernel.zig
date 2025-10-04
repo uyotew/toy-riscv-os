@@ -1,12 +1,9 @@
-// https://operating-system-in-1000-lines.vercel.app/en/
-// maybe also add interrupt handling??
-
 const std = @import("std");
-const builtin = @import("builtin");
 
-extern var __stack_top: anyopaque;
+extern var __kernel_base: anyopaque;
 extern var __bss: anyopaque;
 extern var __bss_end: anyopaque;
+extern var __stack_top: anyopaque;
 extern var __free_ram: anyopaque;
 extern var __free_ram_end: anyopaque;
 
@@ -29,15 +26,15 @@ pub fn main() void {
 
     const free_ram_len = @intFromPtr(&__free_ram_end) - @intFromPtr(&__free_ram);
     const free_ram = @as([*]u8, @ptrCast(&__free_ram))[0..free_ram_len];
-    const fba: std.heap.FixedBufferAllocator = .init(free_ram);
-    _ = fba;
+    var fba: std.heap.FixedBufferAllocator = .init(free_ram);
+    const allocator = fba.allocator();
 
-    idle_proc = .create(0);
+    idle_proc = .create(allocator, 0);
     idle_proc.pid = 0;
     current_proc = idle_proc;
 
-    proc1 = .create(@intFromPtr(&proc1Entry));
-    proc2 = .create(@intFromPtr(&proc2Entry));
+    proc1 = .create(allocator, @intFromPtr(&proc1Entry));
+    proc2 = .create(allocator, @intFromPtr(&proc2Entry));
 
     yield();
     @panic("switched to idle process");
@@ -57,20 +54,23 @@ fn yield() void {
     } else return;
     if (current_proc == next) return;
 
-    asm volatile ("csrw sscratch, %[sscratch]"
-        :
-        : [sscratch] "r" (@intFromPtr(&next.stack) + next.stack.len),
-    );
-
     const prev: *Process = current_proc;
     current_proc = next;
 
     asm volatile (
+        \\sfence.vma
+        \\csrw satp, %[satp]
+        \\sfence.vma
+        \\
+        \\csrw sscratch, %[sscratch]
+        \\
         \\mv a0, %[prev_sp]
         \\mv a1, %[next_sp]
         \\jal %[switchContext]
         :
-        : [prev_sp] "r" (&prev.sp),
+        : [satp] "r" (PageTable.satp_sv32 | (@intFromPtr(next.page_table.table1) / PageTable.page_size)),
+          [sscratch] "r" (@intFromPtr(&next.stack) + next.stack.len),
+          [prev_sp] "r" (&prev.sp),
           [next_sp] "r" (&next.sp),
           [switchContext] "X" (&switchContext),
         : .{ .x1 = true }); // x1 is ra, clobbered by jal
@@ -93,15 +93,17 @@ const Process = struct {
     pid: usize = undefined,
     state: enum { unused, runnable } = .unused,
     sp: usize = undefined,
+    page_table: PageTable = undefined,
     stack: [8192]u8 = undefined,
 
-    fn create(pc: usize) *Process {
+    fn create(allocator: std.mem.Allocator, pc: usize) *Process {
         const idx = for (0..processes.len) |i| {
             if (processes[i].state == .unused) break i;
         } else @panic("no unused process slots");
 
         const proc = &processes[idx];
 
+        proc.page_table = .init(allocator);
         @memset(proc.stack[proc.stack.len - 4 * 12 ..], 0); // set s0..11 'registers' on stack to 0
         proc.stack[proc.stack.len - 4 * 13 ..][0..4].* = std.mem.toBytes(pc); // set ra to pc
         proc.pid = idx + 1;
@@ -149,6 +151,55 @@ fn switchContext() callconv(.naked) void {
         \\ret
     );
 }
+
+const PageTable = struct {
+    table1: [*]Page,
+    const page_size = 4096;
+    const satp_sv32 = 1 << 31;
+    const Page = packed struct(u32) {
+        flags: Flags,
+        page_num: u22,
+    };
+
+    const Flags = packed struct(u10) {
+        valid: bool = false,
+        read: bool = false,
+        write: bool = false,
+        execute: bool = false,
+        user: bool = false,
+        reserved: u5 = 0,
+    };
+
+    fn init(allocator: std.mem.Allocator) PageTable {
+        const table = allocator.alignedAlloc(Page, .fromByteUnits(page_size), page_size) catch @panic("OOM");
+        for (table) |*p| p.flags = .{};
+        var pt: PageTable = .{ .table1 = table.ptr };
+
+        var paddr = @intFromPtr(&__kernel_base);
+        while (paddr < @intFromPtr(&__free_ram_end)) : (paddr += page_size) {
+            const flags: Flags = .{ .read = true, .write = true, .execute = true };
+            pt.mapPage(allocator, paddr, paddr, flags);
+        }
+        return pt;
+    }
+
+    fn mapPage(pt: PageTable, allocator: std.mem.Allocator, vaddr: usize, paddr: usize, flags: Flags) void {
+        if (!std.mem.isAligned(vaddr, page_size)) std.debug.panic("unaligned vaddr {x}", .{vaddr});
+        if (!std.mem.isAligned(paddr, page_size)) std.debug.panic("unaligned paddr {x}", .{paddr});
+
+        const vpn1 = (vaddr >> 22) & 0b11111_11111;
+        if (!pt.table1[vpn1].flags.valid) {
+            const pt_paddr = (allocator.alignedAlloc(u8, .fromByteUnits(page_size), page_size) catch @panic("OOM")).ptr;
+            pt.table1[vpn1].flags = .{ .valid = true };
+            pt.table1[vpn1].page_num = @intCast(@intFromPtr(pt_paddr) / page_size);
+        }
+        const vpn0 = (vaddr >> 12) & 0b11111_11111;
+        const table0: [*]Page = @ptrFromInt(@as(usize, pt.table1[vpn1].page_num) * page_size);
+        table0[vpn0].flags = flags;
+        table0[vpn0].flags.valid = true;
+        table0[vpn0].page_num = @intCast(paddr / page_size);
+    }
+};
 
 fn enterKernel() align(4) callconv(.naked) void {
     asm volatile (
