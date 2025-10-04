@@ -59,9 +59,8 @@ fn yield() void {
     const prev: *Process = current_proc;
     current_proc = next;
 
-    // doesn't work in ReleaseSmall
-    // a ret instruction is added right after this,
-    // and the ra register points to it, creating an infinite loop
+    // i assume there are potential bugs here
+    // seems to work in all optimize modes for now..
     asm volatile (
         \\mv a0, %[prev_sp]
         \\mv a1, %[next_sp]
@@ -70,7 +69,7 @@ fn yield() void {
         : [prev_sp] "r" (&prev.sp),
           [next_sp] "r" (&next.sp),
           [switchContext] "X" (&switchContext),
-    );
+        : .{ .x1 = true }); // x1 is ra, clobbered by jal
 }
 
 fn proc1Entry() noreturn {
@@ -111,7 +110,7 @@ const Process = struct {
     }
 };
 
-fn switchContext() callconv(.naked) noreturn {
+fn switchContext() callconv(.naked) void {
     asm volatile (
         \\addi sp, sp, -4 * 13
         \\sw ra, 4 * 0(sp)
@@ -231,7 +230,34 @@ fn handleTrap(_: *TrapFrame) void {
     const scause = readCsr("scause");
     const stval = readCsr("stval");
     const user_pc = readCsr("sepc");
-    std.debug.panic("unexpected trap scause={x}, stval={x}, sepc={x}", .{ scause, stval, user_pc });
+    const scause_str = switch (scause) {
+        0 => "instruction address misaligned",
+        1 => "instruction access fault",
+        2 => "illegal instruction",
+        3 => "breakpoint",
+        4 => "load address misaligned",
+        5 => "load access fault",
+        6 => "store/AMO address misaligned",
+        7 => "store/AMO access fault",
+        8 => "environment call from U-mode or VU-mode",
+        9 => "environment call from HS-mode",
+        10 => "environment call from VS-mode",
+        11 => "environment call from M-mode",
+        12 => "instruction page fault",
+        13 => "load page fault",
+        15 => "store/AMO page fault",
+        20 => "instruction guest-page fault",
+        21 => "load guest-page fault",
+        22 => "virtual instruction",
+        23 => "store/AMO guest-page fault",
+        else => "",
+    };
+    std.debug.panic("unexpected trap scause={x}, stval={x}, sepc={x}\ncause: {s}", .{
+        scause,
+        stval,
+        user_pc,
+        scause_str,
+    });
 }
 
 fn readCsr(comptime regname: []const u8) usize {

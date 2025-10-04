@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    kernel.entry = .disabled;
     kernel.setLinkerScript(b.path("kernel.ld"));
 
     b.installArtifact(kernel);
