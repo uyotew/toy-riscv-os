@@ -302,7 +302,10 @@ fn kernelEntry() align(4) callconv(.naked) void {
     );
 }
 
-fn handleTrap(tf: *TrapFrame) void {
+// tf will sometimes point to address 0 when building in debug mode
+// if callconv(.c) is not used
+// i assume zig by default doesn't enforce a0 being used for the first arg?
+fn handleTrap(tf: *TrapFrame) callconv(.c) void {
     const scause = readCsr("scause");
     const stval = readCsr("stval");
     const user_pc = readCsr("sepc");
