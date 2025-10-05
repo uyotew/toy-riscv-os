@@ -8,10 +8,17 @@ pub fn build(b: *std.Build) void {
         .abi = .none,
     });
 
+    const usrstd = b.addModule("usrstd", .{
+        .root_source_file = b.path("usrstd.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const kernel = b.addExecutable(.{
         .name = "kernel.elf",
         .root_module = b.createModule(.{
             .root_source_file = b.path("kernel.zig"),
+            .imports = &.{.{ .name = "usrstd", .module = usrstd }},
             .target = target,
             .optimize = optimize,
             .stack_protector = false,
@@ -22,12 +29,6 @@ pub fn build(b: *std.Build) void {
     kernel.entry = .disabled;
     kernel.setLinkerScript(b.path("kernel.ld"));
     b.installArtifact(kernel);
-
-    const usrstd = b.addModule("usrstd", .{
-        .root_source_file = b.path("usrstd.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
 
     const shell = b.addExecutable(.{
         .name = "shell.elf",

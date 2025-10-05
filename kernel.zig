@@ -1,4 +1,5 @@
 const std = @import("std");
+const usrstd = @import("usrstd");
 
 const shell_bin = @embedFile("shell.bin");
 
@@ -48,14 +49,15 @@ pub fn main() void {
 }
 
 fn userEntry() callconv(.naked) void {
-    const sstatus_spie = 1 << 5;
+    const SPIE = 1 << 5; // something to do with interrupts (won't be used though)
+    const SUM = 1 << 18; // allow user memory to be accessed by kernel (for the write syscall)
     asm volatile (
         \\csrw sepc, %[sepc]
         \\csrw sstatus, %[sstatus]
         \\sret
         :
         : [sepc] "r" (PageTable.user_bin_base),
-          [sstatus] "r" (sstatus_spie),
+          [sstatus] "r" (SPIE | SUM),
     );
 }
 
@@ -301,38 +303,62 @@ fn kernelEntry() align(4) callconv(.naked) void {
     );
 }
 
-fn handleTrap(_: *TrapFrame) void {
+fn handleTrap(tf: *TrapFrame) void {
     const scause = readCsr("scause");
     const stval = readCsr("stval");
     const user_pc = readCsr("sepc");
-    const scause_str = switch (scause) {
-        0 => "instruction address misaligned",
-        1 => "instruction access fault",
-        2 => "illegal instruction",
-        3 => "breakpoint",
-        4 => "load address misaligned",
-        5 => "load access fault",
-        6 => "store/AMO address misaligned",
-        7 => "store/AMO access fault",
-        8 => "environment call from U-mode or VU-mode",
-        9 => "environment call from HS-mode",
-        10 => "environment call from VS-mode",
-        11 => "environment call from M-mode",
-        12 => "instruction page fault",
-        13 => "load page fault",
-        15 => "store/AMO page fault",
-        20 => "instruction guest-page fault",
-        21 => "load guest-page fault",
-        22 => "virtual instruction",
-        23 => "store/AMO guest-page fault",
-        else => "",
-    };
-    std.debug.panic("unexpected trap scause={x}, stval={x}, sepc={x}\ncause: {s}", .{
-        scause,
-        stval,
-        user_pc,
-        scause_str,
-    });
+    if (scause == 8) { // syscall
+        const num = std.enums.fromInt(usrstd.sys.SysNum, tf.a3) orelse
+            std.debug.panic("unimplemented syscall a3={}", .{tf.a3});
+        switch (num) {
+            .write => {
+                const slice = @as([*]u8, @ptrFromInt(tf.a0))[0..tf.a1];
+                var buf: [256]u8 = undefined;
+                const len = @min(slice.len, buf.len);
+                @memcpy(buf[0..len], slice[0..len]);
+                // sbi calls fail if using user memory directly, so just copy it to kernel space
+                // before calling write
+                const ret = sbi.call(.{
+                    .eid = .dbcn,
+                    .fid = sbi.fid.dbcn.write,
+                    .a0 = len,
+                    .a1 = @intFromPtr(&buf),
+                });
+                tf.a0 = ret.val; // ignores errors
+            },
+        }
+        // move to after ecall instruction in user bin
+        writeCsr("sepc", user_pc + 4);
+    } else {
+        const scause_str = switch (scause) {
+            0 => "instruction address misaligned",
+            1 => "instruction access fault",
+            2 => "illegal instruction",
+            3 => "breakpoint",
+            4 => "load address misaligned",
+            5 => "load access fault",
+            6 => "store/AMO address misaligned",
+            7 => "store/AMO access fault",
+            8 => "environment call from U-mode or VU-mode",
+            9 => "environment call from HS-mode",
+            10 => "environment call from VS-mode",
+            11 => "environment call from M-mode",
+            12 => "instruction page fault",
+            13 => "load page fault",
+            15 => "store/AMO page fault",
+            20 => "instruction guest-page fault",
+            21 => "load guest-page fault",
+            22 => "virtual instruction",
+            23 => "store/AMO guest-page fault",
+            else => "",
+        };
+        std.debug.panic("unexpected trap scause={x}, stval={x}, sepc={x}\ncause: {s}", .{
+            scause,
+            stval,
+            user_pc,
+            scause_str,
+        });
+    }
 }
 
 fn readCsr(comptime regname: []const u8) usize {
