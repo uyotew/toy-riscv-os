@@ -64,7 +64,7 @@ fn yield() void {
     const next: *Process = for (0..processes.len) |i| {
         const proc: *Process = &processes[(current_proc.pid + i) % processes.len];
         if (proc.state == .runnable and proc.pid != 0) break proc;
-    } else return;
+    } else idle_proc;
     if (current_proc == next) return;
 
     const prev: *Process = current_proc;
@@ -91,7 +91,7 @@ fn yield() void {
 
 const Process = struct {
     pid: usize = undefined,
-    state: enum { unused, runnable } = .unused,
+    state: enum { unused, runnable, exited } = .unused,
     sp: usize = undefined,
     page_table: PageTable = undefined,
     stack: [8192]u8 align(4) = undefined,
@@ -314,9 +314,18 @@ fn handleTrap(tf: *TrapFrame) callconv(.c) void {
             std.debug.panic("unimplemented syscall a3={}", .{tf.a3});
         switch (num) {
             .putc => _ = sbi.call(.{ .eid = .putc, .a0 = tf.a0 }),
-            .getc => {
+            .getc => while (true) {
                 const ret = sbi.call(.{ .eid = .getc });
-                tf.a0 = @bitCast(ret.val);
+                if (ret.err >= 0) {
+                    tf.a0 = @bitCast(ret.err);
+                    break;
+                } else yield();
+            },
+            .exit => {
+                print("process {} exited\n", .{current_proc.pid});
+                current_proc.state = .exited;
+                yield();
+                std.debug.panic("failed to exit from process {}", .{current_proc.pid});
             },
         }
         // move to after ecall instruction in user bin
@@ -400,24 +409,19 @@ const TrapFrame = packed struct {
     sp: usize,
 };
 
-fn halt() noreturn {
-    while (true) {} // can this be while (true) asm volatile ("wfi"); instead
-}
 pub const panic = std.debug.FullPanic(struct {
     fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
         const addr = first_trace_addr orelse @returnAddress();
         var w = sbi.writer(&.{});
         w.interface.print("panic at 0x{x}: {s}\n", .{ addr, msg }) catch {};
-        halt();
+        while (true) {}
     }
 }.panicFn);
 
-const debug = struct {
-    fn print(comptime fmt: []const u8, args: anytype) void {
-        var w = sbi.writer(&.{});
-        w.interface.print(fmt, args) catch return;
-    }
-};
+fn print(comptime fmt: []const u8, args: anytype) void {
+    var w = sbi.writer(&.{});
+    w.interface.print(fmt, args) catch return;
+}
 
 const sbi = struct {
     const Eid = enum(usize) { // extension id

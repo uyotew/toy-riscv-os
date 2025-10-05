@@ -1,4 +1,5 @@
 const root = @import("root");
+const std = @import("std");
 
 extern var __stack_top: anyopaque;
 
@@ -14,14 +15,15 @@ export fn start() linksection(".text.start") callconv(.naked) noreturn {
     );
 }
 
-fn exit() noreturn {
-    while (true) {}
+pub fn exit() noreturn {
+    sys.exit();
 }
 
 pub const sys = struct {
     pub const SysNum = enum(usize) {
         putc = 0,
         getc = 1,
+        exit = 2,
     };
     pub fn syscall(num: SysNum, arg0: usize, arg1: usize, arg2: usize) isize {
         return asm volatile ("ecall"
@@ -39,15 +41,59 @@ pub const sys = struct {
     pub fn getc() isize {
         return syscall(.getc, 0, 0, 0);
     }
+    pub fn exit() noreturn {
+        _ = syscall(.exit, 0, 0, 0);
+        while (true) {} // should not be reached
+    }
 };
 
-pub fn write(buf: []const u8) void {
-    for (buf) |b| sys.putc(b);
-}
+pub const console = struct {
+    pub fn print(comptime fmt: []const u8, args: anytype) void {
+        var w = writer(&.{});
+        w.interface.print(fmt, args) catch unreachable;
+    }
 
-// blocking version of sys.getc
-pub fn getByte() u8 {
-    var res: isize = -1;
-    while (res < 0) res = sys.getc();
-    return @intCast(res);
-}
+    pub fn write(buf: []const u8) void {
+        for (buf) |b| sys.putc(b);
+    }
+
+    pub fn writeByte(b: u8) void {
+        sys.putc(b);
+    }
+
+    pub fn readByte() u8 {
+        return @intCast(sys.getc());
+    }
+
+    pub fn writer(buf: []u8) Writer {
+        return .init(buf);
+    }
+
+    const Writer = struct {
+        interface: std.Io.Writer,
+
+        fn init(buf: []u8) Writer {
+            return .{ .interface = .{
+                .buffer = buf,
+                .vtable = &.{ .drain = drain },
+            } };
+        }
+
+        fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const buffered = io_w.buffered();
+            if (buffered.len != 0) {
+                write(buffered);
+                return io_w.consume(buffered.len);
+            }
+            for (data[0 .. data.len - 1]) |buf| {
+                if (buf.len == 0) continue;
+                write(buf);
+                return io_w.consume(buf.len);
+            }
+            const pattern = data[data.len - 1];
+            if (pattern.len == 0 or splat == 0) return 0;
+            write(pattern);
+            return io_w.consume(pattern.len);
+        }
+    };
+};
