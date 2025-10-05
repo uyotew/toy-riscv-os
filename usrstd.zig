@@ -20,11 +20,12 @@ fn exit() noreturn {
 
 pub const sys = struct {
     pub const SysNum = enum(usize) {
-        write = 0,
+        putc = 0,
+        getc = 1,
     };
-    pub fn syscall(num: SysNum, arg0: usize, arg1: usize, arg2: usize) usize {
+    pub fn syscall(num: SysNum, arg0: usize, arg1: usize, arg2: usize) isize {
         return asm volatile ("ecall"
-            : [ret] "={a0}" (-> usize),
+            : [ret] "={a0}" (-> isize),
             : [a0] "{a0}" (arg0),
               [a1] "{a1}" (arg1),
               [a2] "{a2}" (arg2),
@@ -32,7 +33,21 @@ pub const sys = struct {
             : .{ .memory = true });
     }
 
-    pub fn write(buf: []const u8) usize {
-        return syscall(.write, @intFromPtr(buf.ptr), buf.len, 0);
+    pub fn putc(ch: u8) void {
+        _ = syscall(.putc, ch, 0, 0);
+    }
+    pub fn getc() isize {
+        return syscall(.getc, 0, 0, 0);
     }
 };
+
+pub fn write(buf: []const u8) void {
+    for (buf) |b| sys.putc(b);
+}
+
+// blocking version of sys.getc
+pub fn getByte() u8 {
+    var res: isize = -1;
+    while (res < 0) res = sys.getc();
+    return @intCast(res);
+}

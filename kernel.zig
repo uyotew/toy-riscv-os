@@ -50,14 +50,13 @@ pub fn main() void {
 
 fn userEntry() callconv(.naked) void {
     const SPIE = 1 << 5; // something to do with interrupts (won't be used though)
-    const SUM = 1 << 18; // allow user memory to be accessed by kernel (for the write syscall)
     asm volatile (
         \\csrw sepc, %[sepc]
         \\csrw sstatus, %[sstatus]
         \\sret
         :
         : [sepc] "r" (PageTable.user_bin_base),
-          [sstatus] "r" (SPIE | SUM),
+          [sstatus] "r" (SPIE),
     );
 }
 
@@ -311,20 +310,10 @@ fn handleTrap(tf: *TrapFrame) void {
         const num = std.enums.fromInt(usrstd.sys.SysNum, tf.a3) orelse
             std.debug.panic("unimplemented syscall a3={}", .{tf.a3});
         switch (num) {
-            .write => {
-                const slice = @as([*]u8, @ptrFromInt(tf.a0))[0..tf.a1];
-                var buf: [256]u8 = undefined;
-                const len = @min(slice.len, buf.len);
-                @memcpy(buf[0..len], slice[0..len]);
-                // sbi calls fail if using user memory directly, so just copy it to kernel space
-                // before calling write
-                const ret = sbi.call(.{
-                    .eid = .dbcn,
-                    .fid = sbi.fid.dbcn.write,
-                    .a0 = len,
-                    .a1 = @intFromPtr(&buf),
-                });
-                tf.a0 = ret.val; // ignores errors
+            .putc => _ = sbi.call(.{ .eid = .putc, .a0 = tf.a0 }),
+            .getc => {
+                const ret = sbi.call(.{ .eid = .getc });
+                tf.a0 = @bitCast(ret.val);
             },
         }
         // move to after ecall instruction in user bin
@@ -429,68 +418,8 @@ const debug = struct {
 
 const sbi = struct {
     const Eid = enum(usize) { // extension id
-        dbcn = 0x4442434E, // debug console?
-    };
-    const fid = struct { // function id
-        const dbcn = struct {
-            const write = 0x0;
-            const read = 0x1;
-            const write_byte = 0x2;
-        };
-    };
-
-    const ReturnCode = enum(isize) {
-        SUCCESS = 0,
-        FAILED = -1,
-        NOT_SUPPORTED = -2,
-        INVALID_PARAM = -3,
-        DENIED = -4,
-        INVALID_ADDRESS = -5,
-        ALREADY_AVAILABLE = -6,
-        ALREADY_STARTED = -7,
-        ALREADY_STOPPED = -8,
-        NO_SHMEM = -9,
-        INVALID_STATE = -10,
-        BAD_RANGE = -11,
-        TIMEOUT = -12,
-        IO = -13,
-        DENIED_LOCKED = -14,
-
-        fn toError(rc: ReturnCode) Error!void {
-            return switch (rc) {
-                .SUCCESS => {},
-                .FAILED => error.Failed,
-                .NOT_SUPPORTED => error.NotSupported,
-                .INVALID_PARAM => error.InvalidParam,
-                .DENIED => error.Denied,
-                .INVALID_ADDRESS => error.InvalidAddress,
-                .ALREADY_AVAILABLE => error.AlreadyAvailable,
-                .ALREADY_STARTED => error.AlreadyStarted,
-                .ALREADY_STOPPED => error.AlreadyStopped,
-                .NO_SHMEM => error.NoShmem,
-                .INVALID_STATE => error.InvalidState,
-                .BAD_RANGE => error.BadRange,
-                .TIMEOUT => error.Timeout,
-                .IO => error.Io,
-                .DENIED_LOCKED => error.DeniedLocked,
-            };
-        }
-    };
-    const Error = error{
-        Failed,
-        NotSupported,
-        InvalidParam,
-        Denied,
-        InvalidAddress,
-        AlreadyAvailable,
-        AlreadyStarted,
-        AlreadyStopped,
-        NoShmem,
-        InvalidState,
-        BadRange,
-        Timeout,
-        Io,
-        DeniedLocked,
+        putc = 1,
+        getc = 2,
     };
 
     const CallParams = struct {
@@ -500,17 +429,17 @@ const sbi = struct {
         a3: usize = 0,
         a4: usize = 0,
         a5: usize = 0,
-        fid: usize,
+        fid: usize = 0,
         eid: Eid,
     };
     const Ret = struct {
-        err: ReturnCode,
-        val: usize,
+        err: isize,
+        val: isize,
     };
 
     fn call(cp: CallParams) Ret {
         var err: isize = 0;
-        var val: usize = 0;
+        var val: isize = 0;
         asm volatile ("ecall"
             : [err] "={a0}" (err),
               [val] "={a1}" (val),
@@ -524,25 +453,20 @@ const sbi = struct {
               [eid] "{a7}" (@intFromEnum(cp.eid)),
             : .{ .memory = true });
 
-        return .{ .err = @enumFromInt(err), .val = val };
+        return .{ .err = err, .val = val };
     }
 
-    fn write(bytes: []const u8) Error!usize {
-        const res = call(.{
-            .eid = .dbcn,
-            .fid = fid.dbcn.write,
-            .a0 = bytes.len,
-            .a1 = @intFromPtr(bytes.ptr),
-        });
-        try res.err.toError();
-        return res.val;
+    fn write(bytes: []const u8) error{WriteFailed}!void {
+        for (bytes) |b| {
+            const ret = call(.{ .eid = .putc, .a0 = b });
+            if (ret.err != 0) return error.WriteFailed;
+        }
     }
 
     fn writer(buf: []u8) Writer {
         return .init(buf);
     }
     const Writer = struct {
-        err: ?Error = null,
         interface: std.Io.Writer,
 
         fn init(buf: []u8) Writer {
@@ -553,30 +477,20 @@ const sbi = struct {
         }
 
         fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-            const w: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
             const buffered = io_w.buffered();
             if (buffered.len != 0) {
-                const n = write(buffered) catch |err| {
-                    w.err = err;
-                    return error.WriteFailed;
-                };
-                return io_w.consume(n);
+                try write(buffered);
+                return io_w.consume(buffered.len);
             }
             for (data[0 .. data.len - 1]) |buf| {
                 if (buf.len == 0) continue;
-                const n = write(buf) catch |err| {
-                    w.err = err;
-                    return error.WriteFailed;
-                };
-                return io_w.consume(n);
+                try write(buf);
+                return io_w.consume(buf.len);
             }
             const pattern = data[data.len - 1];
             if (pattern.len == 0 or splat == 0) return 0;
-            const n = write(pattern) catch |err| {
-                w.err = err;
-                return error.WriteFailed;
-            };
-            return io_w.consume(n);
+            try write(pattern);
+            return io_w.consume(pattern.len);
         }
     };
 };

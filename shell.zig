@@ -7,12 +7,12 @@ comptime {
 pub const panic = std.debug.FullPanic(struct {
     fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
         _ = first_trace_addr orelse @returnAddress();
-        _ = usrstd.sys.write(msg);
-        _ = usrstd.sys.write("\n");
+        _ = usrstd.write(msg);
+        _ = usrstd.write("\n");
         while (true) {}
     }
 }.panicFn);
 
 pub fn main() void {
-    _ = usrstd.sys.write("hello from shell\n");
+    _ = usrstd.write("hello from shell\n");
 }
