@@ -1,11 +1,17 @@
 const std = @import("std");
 
+const shell_bin = @embedFile("shell.bin");
+
 extern var __kernel_base: anyopaque;
 extern var __bss: anyopaque;
 extern var __bss_end: anyopaque;
 extern var __stack_top: anyopaque;
 extern var __free_ram: anyopaque;
 extern var __free_ram_end: anyopaque;
+
+var processes: [8]Process = .{Process{}} ** 8;
+var current_proc: *Process = undefined;
+var idle_proc: *Process = undefined;
 
 export fn boot() linksection(".text.boot") callconv(.naked) noreturn {
     asm volatile (
@@ -22,30 +28,36 @@ pub fn main() void {
     const bss = @as([*]u8, @ptrCast(&__bss))[0..bss_len];
     @memset(bss, 0);
 
-    writeCsr("stvec", @intFromPtr(&enterKernel));
+    writeCsr("stvec", @intFromPtr(&kernelEntry));
 
     const free_ram_len = @intFromPtr(&__free_ram_end) - @intFromPtr(&__free_ram);
     const free_ram = @as([*]u8, @ptrCast(&__free_ram))[0..free_ram_len];
+    @memset(free_ram, 0);
     var fba: std.heap.FixedBufferAllocator = .init(free_ram);
     const allocator = fba.allocator();
 
-    idle_proc = .create(allocator, 0);
+    idle_proc = .create(allocator, &.{});
     idle_proc.pid = 0;
     current_proc = idle_proc;
 
-    proc1 = .create(allocator, @intFromPtr(&proc1Entry));
-    proc2 = .create(allocator, @intFromPtr(&proc2Entry));
+    const shell: *Process = .create(allocator, shell_bin);
+    _ = shell;
 
     yield();
     @panic("switched to idle process");
 }
 
-var processes: [8]Process = .{Process{}} ** 8;
-var current_proc: *Process = undefined;
-var idle_proc: *Process = undefined;
-
-var proc1: *Process = undefined;
-var proc2: *Process = undefined;
+fn userEntry() callconv(.naked) void {
+    const sstatus_spie = 1 << 5;
+    asm volatile (
+        \\csrw sepc, %[sepc]
+        \\csrw sstatus, %[sstatus]
+        \\sret
+        :
+        : [sepc] "r" (PageTable.user_bin_base),
+          [sstatus] "r" (sstatus_spie),
+    );
+}
 
 fn yield() void {
     const next: *Process = for (0..processes.len) |i| {
@@ -76,27 +88,14 @@ fn yield() void {
         : .{ .x1 = true }); // x1 is ra, clobbered by jal
 }
 
-fn proc1Entry() void {
-    while (true) {
-        yield();
-        debug.print("1", .{});
-    }
-}
-fn proc2Entry() void {
-    while (true) {
-        yield();
-        debug.print("2", .{});
-    }
-}
-
 const Process = struct {
     pid: usize = undefined,
     state: enum { unused, runnable } = .unused,
     sp: usize = undefined,
     page_table: PageTable = undefined,
-    stack: [8192]u8 = undefined,
+    stack: [8192]u8 align(4) = undefined,
 
-    fn create(allocator: std.mem.Allocator, pc: usize) *Process {
+    fn create(allocator: std.mem.Allocator, bin_image: []const u8) *Process {
         const idx = for (0..processes.len) |i| {
             if (processes[i].state == .unused) break i;
         } else @panic("no unused process slots");
@@ -104,11 +103,15 @@ const Process = struct {
         const proc = &processes[idx];
 
         proc.page_table = .init(allocator);
-        @memset(proc.stack[proc.stack.len - 4 * 12 ..], 0); // set s0..11 'registers' on stack to 0
-        proc.stack[proc.stack.len - 4 * 13 ..][0..4].* = std.mem.toBytes(pc); // set ra to pc
+        proc.page_table.mapKernelPages(allocator);
+        proc.page_table.mapUserImage(allocator, bin_image);
+
+        const stack: []u32 = @ptrCast(&proc.stack);
+        @memset(stack[stack.len - 12 ..], 0); // init s0...s11;
+        stack[stack.len - 13] = @intFromPtr(&userEntry);
         proc.pid = idx + 1;
         proc.state = .runnable;
-        proc.sp = @intFromPtr(&proc.stack[proc.stack.len - 4 * 13]);
+        proc.sp = @intFromPtr(&stack[stack.len - 13]);
 
         return proc;
     }
@@ -168,19 +171,35 @@ const PageTable = struct {
         execute: bool = false,
         user: bool = false,
         reserved: u5 = 0,
+
+        const rwx: Flags = .{ .read = true, .write = true, .execute = true };
+        const urwx: Flags = .{ .user = true, .read = true, .write = true, .execute = true };
     };
 
     fn init(allocator: std.mem.Allocator) PageTable {
-        const table = allocator.alignedAlloc(Page, .fromByteUnits(page_size), page_size) catch @panic("OOM");
+        const table = allocator.alignedAlloc(Page, .fromByteUnits(page_size), page_size / 4) catch @panic("OOM");
         for (table) |*p| p.flags = .{};
-        var pt: PageTable = .{ .table1 = table.ptr };
-
+        return .{ .table1 = table.ptr };
+    }
+    fn mapKernelPages(pt: PageTable, allocator: std.mem.Allocator) void {
         var paddr = @intFromPtr(&__kernel_base);
         while (paddr < @intFromPtr(&__free_ram_end)) : (paddr += page_size) {
-            const flags: Flags = .{ .read = true, .write = true, .execute = true };
-            pt.mapPage(allocator, paddr, paddr, flags);
+            pt.mapPage(allocator, paddr, paddr, .rwx);
         }
-        return pt;
+    }
+
+    const user_bin_base = 0x1000000;
+
+    fn mapUserImage(pt: PageTable, allocator: std.mem.Allocator, image: []const u8) void {
+        var off: usize = 0;
+        while (off < image.len) : (off += page_size) {
+            const page = allocator.alignedAlloc(u8, .fromByteUnits(page_size), page_size) catch @panic("OOM");
+
+            const to_copy = image[off..][0..@min(page_size, image.len - off)];
+            @memcpy(page[0..to_copy.len], to_copy);
+
+            pt.mapPage(allocator, user_bin_base + off, @intFromPtr(page.ptr), .urwx);
+        }
     }
 
     fn mapPage(pt: PageTable, allocator: std.mem.Allocator, vaddr: usize, paddr: usize, flags: Flags) void {
@@ -201,7 +220,7 @@ const PageTable = struct {
     }
 };
 
-fn enterKernel() align(4) callconv(.naked) void {
+fn kernelEntry() align(4) callconv(.naked) void {
     asm volatile (
         \\csrrw sp, sscratch, sp
         \\addi sp, sp, -4 * 31

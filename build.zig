@@ -5,6 +5,7 @@ pub fn build(b: *std.Build) void {
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .riscv32,
         .os_tag = .freestanding,
+        .abi = .none,
     });
 
     const kernel = b.addExecutable(.{
@@ -20,8 +21,41 @@ pub fn build(b: *std.Build) void {
 
     kernel.entry = .disabled;
     kernel.setLinkerScript(b.path("kernel.ld"));
-
     b.installArtifact(kernel);
+
+    const usrstd = b.addModule("usrstd", .{
+        .root_source_file = b.path("usrstd.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const shell = b.addExecutable(.{
+        .name = "shell.elf",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("shell.zig"),
+            .imports = &.{.{ .name = "usrstd", .module = usrstd }},
+            .target = target,
+            .optimize = optimize,
+            .strip = false,
+        }),
+    });
+
+    shell.entry = .disabled;
+    shell.setLinkerScript(b.path("user.ld"));
+
+    const shell2bin = b.addSystemCommand(&.{"llvm-objcopy"});
+    shell2bin.addArgs(&.{ "--set-section-flags", ".bss=alloc,contents" });
+    shell2bin.addArgs(&.{ "-O", "binary" });
+    shell2bin.addArtifactArg(shell);
+    const shell_bin = shell2bin.addOutputFileArg("shell.bin");
+
+    kernel.root_module.addAnonymousImport("shell.bin", .{
+        .root_source_file = shell_bin,
+    });
+
+    // for debugging (inspecting the files)
+    b.installArtifact(shell);
+    b.getInstallStep().dependOn(&b.addInstallBinFile(shell_bin, "shell.bin").step);
 
     const qemu = b.addSystemCommand(&.{"qemu-system-riscv32"});
     qemu.addArgs(&.{ "-machine", "virt" });
