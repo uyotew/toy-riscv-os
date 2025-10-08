@@ -41,12 +41,230 @@ pub fn main() void {
     idle_proc.pid = 0;
     current_proc = idle_proc;
 
-    const shell: *Process = .create(allocator, shell_bin);
-    _ = shell;
+    const shell: *Process = Process.create(allocator, shell_bin);
+    print("starting process: pid={} sp=0x{x} state={t}\n", .{ shell.pid, shell.sp, shell.state });
 
     yield();
     @panic("switched to idle process");
 }
+
+fn kernelEntry() align(4) callconv(.naked) void {
+    asm volatile (
+        \\csrrw sp, sscratch, sp
+        \\addi sp, sp, -4 * 31
+        \\sw ra, 4 * 0(sp)
+        \\sw gp, 4 * 1(sp)
+        \\sw tp, 4 * 2(sp)
+        \\sw t0, 4 * 3(sp)
+        \\sw t1, 4 * 4(sp)
+        \\sw t2, 4 * 5(sp)
+        \\sw t3, 4 * 6(sp)
+        \\sw t4, 4 * 7(sp)
+        \\sw t5, 4 * 8(sp)
+        \\sw t6, 4 * 9(sp)
+        \\sw a0, 4 * 10(sp)
+        \\sw a1, 4 * 11(sp)
+        \\sw a2, 4 * 12(sp)
+        \\sw a3, 4 * 13(sp)
+        \\sw a4, 4 * 14(sp)
+        \\sw a5, 4 * 15(sp)
+        \\sw a6, 4 * 16(sp)
+        \\sw a7, 4 * 17(sp)
+        \\sw s0, 4 * 18(sp)
+        \\sw s1, 4 * 19(sp)
+        \\sw s2, 4 * 20(sp)
+        \\sw s3, 4 * 21(sp)
+        \\sw s4, 4 * 22(sp)
+        \\sw s5, 4 * 23(sp)
+        \\sw s6, 4 * 24(sp)
+        \\sw s7, 4 * 25(sp)
+        \\sw s8, 4 * 26(sp)
+        \\sw s9, 4 * 27(sp)
+        \\sw s10, 4 * 28(sp)
+        \\sw s11, 4 * 29(sp)
+        \\
+        \\csrr a0, sscratch
+        \\sw a0, 4 * 30(sp)
+        \\
+        \\addi a0, sp, 4 * 31
+        \\csrw sscratch, a0
+        \\
+        \\mv a0, sp
+        \\call %[handleTrap]
+        \\
+        \\lw ra, 4 * 0(sp)
+        \\lw gp, 4 * 1(sp)
+        \\lw tp, 4 * 2(sp)
+        \\lw t0, 4 * 3(sp)
+        \\lw t1, 4 * 4(sp)
+        \\lw t2, 4 * 5(sp)
+        \\lw t3, 4 * 6(sp)
+        \\lw t4, 4 * 7(sp)
+        \\lw t5, 4 * 8(sp)
+        \\lw t6, 4 * 9(sp)
+        \\lw a0, 4 * 10(sp)
+        \\lw a1, 4 * 11(sp)
+        \\lw a2, 4 * 12(sp)
+        \\lw a3, 4 * 13(sp)
+        \\lw a4, 4 * 14(sp)
+        \\lw a5, 4 * 15(sp)
+        \\lw a6, 4 * 16(sp)
+        \\lw a7, 4 * 17(sp)
+        \\lw s0, 4 * 18(sp)
+        \\lw s1, 4 * 19(sp)
+        \\lw s2, 4 * 20(sp)
+        \\lw s3, 4 * 21(sp)
+        \\lw s4, 4 * 22(sp)
+        \\lw s5, 4 * 23(sp)
+        \\lw s6, 4 * 24(sp)
+        \\lw s7, 4 * 25(sp)
+        \\lw s8, 4 * 26(sp)
+        \\lw s9, 4 * 27(sp)
+        \\lw s10, 4 * 28(sp)
+        \\lw s11, 4 * 29(sp)
+        \\lw sp, 4 * 30(sp)
+        \\sret
+        :
+        : [handleTrap] "X" (&handleTrap),
+    );
+}
+
+const TrapFrame = packed struct {
+    ra: usize,
+    gp: usize,
+    tp: usize,
+    t0: usize,
+    t1: usize,
+    t2: usize,
+    t3: usize,
+    t4: usize,
+    t5: usize,
+    t6: usize,
+    a0: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+    a7: usize,
+    s0: usize,
+    s1: usize,
+    s2: usize,
+    s3: usize,
+    s4: usize,
+    s5: usize,
+    s6: usize,
+    s7: usize,
+    s8: usize,
+    s9: usize,
+    s10: usize,
+    s11: usize,
+    sp: usize,
+};
+
+fn readCsr(comptime regname: []const u8) usize {
+    return asm volatile ("csrr %[ret], " ++ regname
+        : [ret] "=r" (-> usize),
+    );
+}
+
+fn writeCsr(comptime regname: []const u8, val: usize) void {
+    asm volatile ("csrw " ++ regname ++ ", %[val]"
+        :
+        : [val] "r" (val),
+    );
+}
+
+// tf will sometimes point to address 0 when building in debug mode
+// if callconv(.c) is not used
+// i assume zig by default doesn't enforce a0 being used for the first arg?
+fn handleTrap(tf: *TrapFrame) callconv(.c) void {
+    const scause = readCsr("scause");
+    const stval = readCsr("stval");
+    const user_pc = readCsr("sepc");
+    if (scause == 8) { // syscall
+        const num = std.enums.fromInt(usrstd.sys.SysNum, tf.a3) orelse
+            std.debug.panic("unimplemented syscall a3={}", .{tf.a3});
+
+        switch (num) {
+            .putc => _ = sbi.call(.{ .eid = .putc, .a0 = tf.a0 }),
+            .getc => while (true) {
+                const ret = sbi.call(.{ .eid = .getc });
+                if (ret.err >= 0) {
+                    tf.a0 = @bitCast(ret.err);
+                    break;
+                } else yield();
+            },
+            .exit => {
+                print("process {} exited\n", .{current_proc.pid});
+                current_proc.state = .exited;
+                yield();
+                std.debug.panic("failed to exit from process {}", .{current_proc.pid});
+            },
+        }
+        // move to after ecall instruction in user bin
+        writeCsr("sepc", user_pc + 4);
+    } else {
+        const scause_str = switch (scause) {
+            0 => "instruction address misaligned",
+            1 => "instruction access fault",
+            2 => "illegal instruction",
+            3 => "breakpoint",
+            4 => "load address misaligned",
+            5 => "load access fault",
+            6 => "store/AMO address misaligned",
+            7 => "store/AMO access fault",
+            8 => "environment call from U-mode or VU-mode",
+            9 => "environment call from HS-mode",
+            10 => "environment call from VS-mode",
+            11 => "environment call from M-mode",
+            12 => "instruction page fault",
+            13 => "load page fault",
+            15 => "store/AMO page fault",
+            20 => "instruction guest-page fault",
+            21 => "load guest-page fault",
+            22 => "virtual instruction",
+            23 => "store/AMO guest-page fault",
+            else => "",
+        };
+        std.debug.panic("unexpected trap scause={x}, stval={x}, sepc={x}\ncause: {s}", .{
+            scause,
+            stval,
+            user_pc,
+            scause_str,
+        });
+    }
+}
+
+const Process = struct {
+    pid: usize = undefined,
+    state: enum { unused, runnable, exited } = .unused,
+    sp: usize = undefined,
+    page_table: PageTable = undefined,
+    stack: [8192]u8 align(4) = undefined,
+
+    fn create(allocator: std.mem.Allocator, bin_image: []const u8) *Process {
+        const idx = for (0..processes.len) |i| {
+            if (processes[i].state == .unused) break i;
+        } else @panic("no unused process slots");
+
+        const proc = &processes[idx];
+
+        proc.page_table = .init(allocator);
+        proc.page_table.mapKernelPages(allocator);
+        proc.page_table.mapUserImage(allocator, bin_image);
+
+        const stack: []u32 = @ptrCast(&proc.stack);
+        @memset(stack[stack.len - 12 ..], 0); // init s0...s11;
+        stack[stack.len - 13] = @intFromPtr(&userEntry); // set return address
+        proc.pid = idx + 1;
+        proc.state = .runnable;
+        proc.sp = @intFromPtr(&stack[stack.len - 13]);
+
+        return proc;
+    }
+};
 
 fn userEntry() callconv(.naked) void {
     const SPIE = 1 << 5; // something to do with interrupts (won't be used though)
@@ -88,35 +306,6 @@ fn yield() void {
           [switchContext] "X" (&switchContext),
         : .{ .x1 = true }); // x1 is ra, clobbered by jal
 }
-
-const Process = struct {
-    pid: usize = undefined,
-    state: enum { unused, runnable, exited } = .unused,
-    sp: usize = undefined,
-    page_table: PageTable = undefined,
-    stack: [8192]u8 align(4) = undefined,
-
-    fn create(allocator: std.mem.Allocator, bin_image: []const u8) *Process {
-        const idx = for (0..processes.len) |i| {
-            if (processes[i].state == .unused) break i;
-        } else @panic("no unused process slots");
-
-        const proc = &processes[idx];
-
-        proc.page_table = .init(allocator);
-        proc.page_table.mapKernelPages(allocator);
-        proc.page_table.mapUserImage(allocator, bin_image);
-
-        const stack: []u32 = @ptrCast(&proc.stack);
-        @memset(stack[stack.len - 12 ..], 0); // init s0...s11;
-        stack[stack.len - 13] = @intFromPtr(&userEntry);
-        proc.pid = idx + 1;
-        proc.state = .runnable;
-        proc.sp = @intFromPtr(&stack[stack.len - 13]);
-
-        return proc;
-    }
-};
 
 fn switchContext() callconv(.naked) void {
     asm volatile (
@@ -221,199 +410,10 @@ const PageTable = struct {
     }
 };
 
-fn kernelEntry() align(4) callconv(.naked) void {
-    asm volatile (
-        \\csrrw sp, sscratch, sp
-        \\addi sp, sp, -4 * 31
-        \\sw ra, 4 * 0(sp)
-        \\sw gp, 4 * 1(sp)
-        \\sw tp, 4 * 2(sp)
-        \\sw t0, 4 * 3(sp)
-        \\sw t1, 4 * 4(sp)
-        \\sw t2, 4 * 5(sp)
-        \\sw t3, 4 * 6(sp)
-        \\sw t4, 4 * 7(sp)
-        \\sw t5, 4 * 8(sp)
-        \\sw t6, 4 * 9(sp)
-        \\sw a0, 4 * 10(sp)
-        \\sw a1, 4 * 11(sp)
-        \\sw a2, 4 * 12(sp)
-        \\sw a3, 4 * 13(sp)
-        \\sw a4, 4 * 14(sp)
-        \\sw a5, 4 * 15(sp)
-        \\sw a6, 4 * 16(sp)
-        \\sw a7, 4 * 17(sp)
-        \\sw s0, 4 * 18(sp)
-        \\sw s1, 4 * 19(sp)
-        \\sw s2, 4 * 20(sp)
-        \\sw s3, 4 * 21(sp)
-        \\sw s4, 4 * 22(sp)
-        \\sw s5, 4 * 23(sp)
-        \\sw s6, 4 * 24(sp)
-        \\sw s7, 4 * 25(sp)
-        \\sw s8, 4 * 26(sp)
-        \\sw s9, 4 * 27(sp)
-        \\sw s10, 4 * 28(sp)
-        \\sw s11, 4 * 29(sp)
-        \\
-        \\csrr a0, sscratch
-        \\sw a0, 4 * 30(sp)
-        \\
-        \\addi a0, sp, 4 * 31
-        \\csrw sscratch, a0
-        \\
-        \\mv a0, sp
-        \\call %[handleTrap]
-        \\
-        \\lw ra, 4 * 0(sp)
-        \\lw gp, 4 * 1(sp)
-        \\lw tp, 4 * 2(sp)
-        \\lw t0, 4 * 3(sp)
-        \\lw t1, 4 * 4(sp)
-        \\lw t2, 4 * 5(sp)
-        \\lw t3, 4 * 6(sp)
-        \\lw t4, 4 * 7(sp)
-        \\lw t5, 4 * 8(sp)
-        \\lw t6, 4 * 9(sp)
-        \\lw a0, 4 * 10(sp)
-        \\lw a1, 4 * 11(sp)
-        \\lw a2, 4 * 12(sp)
-        \\lw a3, 4 * 13(sp)
-        \\lw a4, 4 * 14(sp)
-        \\lw a5, 4 * 15(sp)
-        \\lw a6, 4 * 16(sp)
-        \\lw a7, 4 * 17(sp)
-        \\lw s0, 4 * 18(sp)
-        \\lw s1, 4 * 19(sp)
-        \\lw s2, 4 * 20(sp)
-        \\lw s3, 4 * 21(sp)
-        \\lw s4, 4 * 22(sp)
-        \\lw s5, 4 * 23(sp)
-        \\lw s6, 4 * 24(sp)
-        \\lw s7, 4 * 25(sp)
-        \\lw s8, 4 * 26(sp)
-        \\lw s9, 4 * 27(sp)
-        \\lw s10, 4 * 28(sp)
-        \\lw s11, 4 * 29(sp)
-        \\lw sp, 4 * 30(sp)
-        \\sret
-        :
-        : [handleTrap] "X" (&handleTrap),
-    );
-}
-
-// tf will sometimes point to address 0 when building in debug mode
-// if callconv(.c) is not used
-// i assume zig by default doesn't enforce a0 being used for the first arg?
-fn handleTrap(tf: *TrapFrame) callconv(.c) void {
-    const scause = readCsr("scause");
-    const stval = readCsr("stval");
-    const user_pc = readCsr("sepc");
-    if (scause == 8) { // syscall
-        const num = std.enums.fromInt(usrstd.sys.SysNum, tf.a3) orelse
-            std.debug.panic("unimplemented syscall a3={}", .{tf.a3});
-        switch (num) {
-            .putc => _ = sbi.call(.{ .eid = .putc, .a0 = tf.a0 }),
-            .getc => while (true) {
-                const ret = sbi.call(.{ .eid = .getc });
-                if (ret.err >= 0) {
-                    tf.a0 = @bitCast(ret.err);
-                    break;
-                } else yield();
-            },
-            .exit => {
-                print("process {} exited\n", .{current_proc.pid});
-                current_proc.state = .exited;
-                yield();
-                std.debug.panic("failed to exit from process {}", .{current_proc.pid});
-            },
-        }
-        // move to after ecall instruction in user bin
-        writeCsr("sepc", user_pc + 4);
-    } else {
-        const scause_str = switch (scause) {
-            0 => "instruction address misaligned",
-            1 => "instruction access fault",
-            2 => "illegal instruction",
-            3 => "breakpoint",
-            4 => "load address misaligned",
-            5 => "load access fault",
-            6 => "store/AMO address misaligned",
-            7 => "store/AMO access fault",
-            8 => "environment call from U-mode or VU-mode",
-            9 => "environment call from HS-mode",
-            10 => "environment call from VS-mode",
-            11 => "environment call from M-mode",
-            12 => "instruction page fault",
-            13 => "load page fault",
-            15 => "store/AMO page fault",
-            20 => "instruction guest-page fault",
-            21 => "load guest-page fault",
-            22 => "virtual instruction",
-            23 => "store/AMO guest-page fault",
-            else => "",
-        };
-        std.debug.panic("unexpected trap scause={x}, stval={x}, sepc={x}\ncause: {s}", .{
-            scause,
-            stval,
-            user_pc,
-            scause_str,
-        });
-    }
-}
-
-fn readCsr(comptime regname: []const u8) usize {
-    return asm volatile ("csrr %[ret], " ++ regname
-        : [ret] "=r" (-> usize),
-    );
-}
-
-fn writeCsr(comptime regname: []const u8, val: usize) void {
-    asm volatile ("csrw " ++ regname ++ ", %[val]"
-        :
-        : [val] "r" (val),
-    );
-}
-
-const TrapFrame = packed struct {
-    ra: usize,
-    gp: usize,
-    tp: usize,
-    t0: usize,
-    t1: usize,
-    t2: usize,
-    t3: usize,
-    t4: usize,
-    t5: usize,
-    t6: usize,
-    a0: usize,
-    a1: usize,
-    a2: usize,
-    a3: usize,
-    a4: usize,
-    a5: usize,
-    a6: usize,
-    a7: usize,
-    s0: usize,
-    s1: usize,
-    s2: usize,
-    s3: usize,
-    s4: usize,
-    s5: usize,
-    s6: usize,
-    s7: usize,
-    s8: usize,
-    s9: usize,
-    s10: usize,
-    s11: usize,
-    sp: usize,
-};
-
 pub const panic = std.debug.FullPanic(struct {
     fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
         const addr = first_trace_addr orelse @returnAddress();
-        var w = sbi.writer(&.{});
-        w.interface.print("panic at 0x{x}: {s}\n", .{ addr, msg }) catch {};
+        print("panic at 0x{x}: {s}\n", .{ addr, msg });
         while (true) {}
     }
 }.panicFn);
