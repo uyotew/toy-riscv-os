@@ -33,9 +33,17 @@ pub fn main() void {
 
     const free_ram_len = @intFromPtr(&__free_ram_end) - @intFromPtr(&__free_ram);
     const free_ram = @as([*]u8, @ptrCast(&__free_ram))[0..free_ram_len];
-    @memset(free_ram, 0);
     var fba: std.heap.FixedBufferAllocator = .init(free_ram);
     const allocator = fba.allocator();
+
+    const blk = virtio.Blk.init(allocator) catch |err| std.debug.panic("Blk.init error: {t}", .{err});
+    var buf: [virtio.sector_size]u8 = undefined;
+    blk.readSector(&buf, 0);
+    print("sector 0 original content: {s}\n", .{buf});
+    const new_start = "wrote this...";
+    @memcpy(buf[0..new_start.len], new_start);
+    blk.writeSector(&buf, 0);
+    print("sector 0 new content: {s}\n", .{buf});
 
     idle_proc = .create(allocator, &.{});
     idle_proc.pid = 0;
@@ -129,7 +137,7 @@ fn kernelEntry() align(4) callconv(.naked) void {
     );
 }
 
-const TrapFrame = packed struct {
+const TrapFrame = extern struct {
     ra: usize,
     gp: usize,
     tp: usize,
@@ -253,6 +261,7 @@ const Process = struct {
 
         proc.page_table = .init(allocator);
         proc.page_table.mapKernelPages(allocator);
+        proc.page_table.mapPage(allocator, virtio.blk_paddr, virtio.blk_paddr, .rw);
         proc.page_table.mapUserImage(allocator, bin_image);
 
         const stack: []u32 = @ptrCast(&proc.stack);
@@ -362,13 +371,14 @@ const PageTable = struct {
         user: bool = false,
         reserved: u5 = 0,
 
+        const rw: Flags = .{ .read = true, .write = true };
         const rwx: Flags = .{ .read = true, .write = true, .execute = true };
         const urwx: Flags = .{ .user = true, .read = true, .write = true, .execute = true };
     };
 
     fn init(allocator: std.mem.Allocator) PageTable {
         const table = allocator.alignedAlloc(Page, .fromByteUnits(page_size), page_size / 4) catch @panic("OOM");
-        for (table) |*p| p.flags = .{};
+        for (table) |*p| p.flags = .{ .valid = false };
         return .{ .table1 = table.ptr };
     }
     fn mapKernelPages(pt: PageTable, allocator: std.mem.Allocator) void {
@@ -498,6 +508,206 @@ const sbi = struct {
             if (pattern.len == 0 or splat == 0) return 0;
             try write(pattern);
             return io_w.consume(pattern.len);
+        }
+    };
+};
+
+const virtio = struct {
+    const sector_size = 512;
+    const device_blk = 2;
+    const blk_paddr = 0x10001000;
+
+    const Blk = struct {
+        capacity: u64,
+        req_paddr: usize,
+        req: *Request,
+        vq: *Virtqueue,
+
+        const Request = extern struct {
+            dir: enum(u32) { in = 0, out = 1 } align(1),
+            _reserved: u32 align(1),
+            sector: u64 align(1),
+            data: [sector_size]u8 align(1),
+            status: u8 align(1),
+        };
+
+        pub fn init(allocator: std.mem.Allocator) !Blk {
+            if (reg.magic.* != 0x74726976) return error.InvalidMagic;
+            if (reg.version.* != 1) return error.InvalidVersion;
+            if (reg.device_id.* != device_blk) return error.InvalidId;
+
+            reg.device_status.* = .reset;
+            reg.device_status.set(.ack);
+            reg.device_status.set(.driver);
+            reg.device_status.set(.feat_ok); //skip negotiation of features
+
+            const vq: *Virtqueue = .init(allocator, 0);
+
+            reg.device_status.* = .{ .driver_ok = true };
+
+            const capacity = sector_size * reg.device_config.*;
+            print("virtio-blk: capacity is {} bytes\n", .{capacity});
+
+            const alignment: std.mem.Alignment = comptime .fromByteUnits(PageTable.page_size);
+            const num_bytes = alignment.forward(@sizeOf(Request));
+            const paddr_slice = allocator.alignedAlloc(u8, alignment, num_bytes) catch @panic("OOM");
+            const paddr = @intFromPtr(paddr_slice.ptr);
+            @memset(paddr_slice, 0); // init req to all 0
+
+            return .{ .capacity = capacity, .req_paddr = paddr, .req = @ptrFromInt(paddr), .vq = vq };
+        }
+
+        pub fn readSector(blk: Blk, buf: *[sector_size]u8, sector: usize) void {
+            readOrWriteSector(blk, buf, sector, false);
+        }
+
+        pub fn writeSector(blk: Blk, buf: *[sector_size]u8, sector: usize) void {
+            readOrWriteSector(blk, buf, sector, true);
+        }
+
+        fn readOrWriteSector(blk: Blk, buf: *[sector_size]u8, sector: usize, is_write: bool) void {
+            if (sector >= blk.capacity / sector_size) {
+                return print("virtio: tried to access sector={}, but capacity is {}\n", .{ sector, blk.capacity / sector_size });
+            }
+            blk.req.sector = sector;
+            blk.req.dir = if (is_write) .out else .in;
+            if (is_write) @memcpy(&blk.req.data, buf);
+
+            blk.vq.descs[0] = .{
+                .addr = blk.req_paddr,
+                .len = @sizeOf(u32) * 2 + @sizeOf(u64),
+                .flags = .{ .next = true },
+                .next = 1,
+            };
+            blk.vq.descs[1] = .{
+                .addr = blk.req_paddr + @offsetOf(Request, "data"),
+                .len = sector_size,
+                .flags = .{ .next = true, .write = !is_write }, //writable by device if driver is reading
+                .next = 2,
+            };
+            blk.vq.descs[2] = .{
+                .addr = blk.req_paddr + @offsetOf(Request, "status"),
+                .len = @sizeOf(u8),
+                .flags = .{ .write = true },
+                .next = 0,
+            };
+
+            blk.vq.kick(0);
+            while (blk.vq.isBusy()) {}
+            if (blk.req.status != 0) {
+                return print("virtio: failed to access sector={} status={}\n", .{ sector, blk.req.status });
+            }
+            if (!is_write) @memcpy(buf, &blk.req.data);
+        }
+    };
+
+    const reg = struct {
+        const magic: *volatile u32 = @ptrFromInt(0x00 + blk_paddr);
+        const version: *volatile u32 = @ptrFromInt(0x04 + blk_paddr);
+        const device_id: *volatile u32 = @ptrFromInt(0x08 + blk_paddr);
+        const queue_sel: *volatile u32 = @ptrFromInt(0x30 + blk_paddr);
+        const queue_num_max: *volatile u32 = @ptrFromInt(0x34 + blk_paddr);
+        const queue_num: *volatile u32 = @ptrFromInt(0x38 + blk_paddr);
+        const queue_align: *volatile u32 = @ptrFromInt(0x3c + blk_paddr);
+        const queue_pfn: *volatile u32 = @ptrFromInt(0x40 + blk_paddr);
+        const queue_ready: *volatile u32 = @ptrFromInt(0x44 + blk_paddr);
+        const queue_notify: *volatile u32 = @ptrFromInt(0x50 + blk_paddr);
+        const device_status: *volatile DeviceStatus = @ptrFromInt(0x70 + blk_paddr);
+        const device_config: *volatile u64 = @ptrFromInt(0x100 + blk_paddr);
+    };
+
+    const DeviceStatus = packed struct(u32) {
+        ack: bool = false,
+        driver: bool = false,
+        driver_ok: bool = false,
+        feat_ok: bool = false,
+        _unused: u28 = 0,
+
+        pub const reset: DeviceStatus = .{};
+        // cannot set bitfields of volatile pointers to packed structs directly,
+        // the entire value has to be set atomically, so use this function
+        // see last part of https://ziglang.org/documentation/0.15.1/#packed-struct
+        pub fn set(ds: *volatile DeviceStatus, comptime field_tag: std.meta.FieldEnum(DeviceStatus)) void {
+            var prev = ds.*;
+            @field(prev, @tagName(field_tag)) = true;
+            ds.* = prev;
+        }
+    };
+
+    const Virtqueue = extern struct {
+        descs: [entry_num]Descriptor align(1),
+        avail: AvailRing align(1),
+        used: UsedRing align(PageTable.page_size),
+        queue_index: u32 align(1),
+        used_index: *volatile u16 align(1),
+        last_used_index: u16 align(1),
+
+        const entry_num = 16;
+
+        const Descriptor = extern struct {
+            addr: u64 align(1),
+            len: u32 align(1),
+            flags: Flags align(1),
+            next: u16 align(1),
+
+            const Flags = packed struct(u16) {
+                next: bool = false,
+                write: bool = false,
+                _unused: u14 = 0,
+            };
+        };
+
+        const AvailRing = extern struct {
+            flags: Flags align(1),
+            index: u16 align(1),
+            ring: [entry_num]u16 align(1),
+
+            const Flags = packed struct(u16) {
+                no_interrupt: bool = false,
+                _unused: u15 = 0,
+            };
+        };
+
+        const UsedRing = extern struct {
+            flags: u16 align(1),
+            index: u16 align(1),
+            ring: [entry_num]Entry align(1),
+
+            const Entry = extern struct {
+                id: u32 align(1),
+                len: u32 align(1),
+            };
+        };
+
+        pub fn init(allocator: std.mem.Allocator, index: u32) *Virtqueue {
+            const alignment: std.mem.Alignment = comptime .fromByteUnits(PageTable.page_size);
+            const num_bytes = alignment.forward(@sizeOf(Virtqueue));
+            const paddr_slice = allocator.alignedAlloc(u8, alignment, num_bytes) catch @panic("OOM");
+            const paddr = @intFromPtr(paddr_slice.ptr);
+            const vq: *Virtqueue = @ptrCast(paddr_slice.ptr);
+            @memset(paddr_slice, 0); // initialize entire vq to 0
+
+            vq.queue_index = index;
+            vq.used_index = @ptrCast(&vq.used.index);
+
+            reg.queue_sel.* = index;
+            reg.queue_num.* = entry_num;
+            reg.queue_align.* = 0;
+            reg.queue_pfn.* = paddr;
+            return vq;
+        }
+
+        pub fn kick(vq: *Virtqueue, desc_index: u16) void {
+            vq.avail.ring[vq.avail.index % entry_num] = desc_index;
+            vq.avail.index +%= 1;
+            // __sync_syncronize() was here in the book, don't know why
+            // this might be the same?
+            asm volatile ("fence" ::: .{ .memory = true });
+            reg.queue_notify.* = vq.queue_index;
+            vq.last_used_index +%= 1;
+        }
+        pub fn isBusy(vq: *const Virtqueue) bool {
+            return vq.last_used_index != vq.used_index.*;
         }
     };
 };
