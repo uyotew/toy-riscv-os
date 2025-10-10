@@ -14,6 +14,8 @@ var processes: [8]Process = .{Process{}} ** 8;
 var current_proc: *Process = undefined;
 var idle_proc: *Process = undefined;
 
+const page_size = 4096;
+
 export fn boot() linksection(".text.boot") callconv(.naked) noreturn {
     asm volatile (
         \\mv sp, %[stack_top]
@@ -33,28 +35,45 @@ pub fn main() void {
 
     const free_ram_len = @intFromPtr(&__free_ram_end) - @intFromPtr(&__free_ram);
     const free_ram = @as([*]u8, @ptrCast(&__free_ram))[0..free_ram_len];
-    var fba: std.heap.FixedBufferAllocator = .init(free_ram);
-    const allocator = fba.allocator();
+    var page_allocator: PageAllocator = .init(@alignCast(free_ram));
 
-    const blk = virtio.Blk.init(allocator) catch |err| std.debug.panic("Blk.init error: {t}", .{err});
+    const blk = virtio.Blk.init(&page_allocator) catch |err|
+        std.debug.panic("Blk.init error: {t}", .{err});
+
     var buf: [virtio.sector_size]u8 = undefined;
     blk.readSector(&buf, 0);
-    print("sector 0 original content: {s}\n", .{buf});
+    print("sector 0 original content: '{s}'\n", .{buf});
     const new_start = "wrote this...";
     @memcpy(buf[0..new_start.len], new_start);
     blk.writeSector(&buf, 0);
-    print("sector 0 new content: {s}\n", .{buf});
+    print("sector 0 new content: '{s}'\n", .{buf});
 
-    idle_proc = .create(allocator, &.{});
+    idle_proc = .create(&page_allocator, &.{});
     idle_proc.pid = 0;
     current_proc = idle_proc;
 
-    const shell: *Process = Process.create(allocator, shell_bin);
+    const shell: *Process = Process.create(&page_allocator, shell_bin);
     print("starting process: pid={} sp=0x{x} state={t}\n", .{ shell.pid, shell.sp, shell.state });
 
     yield();
     @panic("switched to idle process");
 }
+
+const PageAllocator = struct {
+    mem: []align(page_size) u8,
+    end: usize = 0,
+
+    pub fn init(mem: []align(page_size) u8) PageAllocator {
+        return .{ .mem = mem };
+    }
+
+    pub fn allocPages(pa: *PageAllocator, n: usize) []align(page_size) u8 {
+        const to_alloc = page_size * n;
+        if (pa.end + to_alloc > pa.mem.len) @panic("OOM");
+        defer pa.end += to_alloc;
+        return @alignCast(pa.mem[pa.end..][0..to_alloc]);
+    }
+};
 
 fn kernelEntry() align(4) callconv(.naked) void {
     asm volatile (
@@ -252,17 +271,17 @@ const Process = struct {
     page_table: PageTable = undefined,
     stack: [8192]u8 align(4) = undefined,
 
-    fn create(allocator: std.mem.Allocator, bin_image: []const u8) *Process {
+    fn create(pa: *PageAllocator, bin_image: []const u8) *Process {
         const idx = for (0..processes.len) |i| {
             if (processes[i].state == .unused) break i;
         } else @panic("no unused process slots");
 
         const proc = &processes[idx];
 
-        proc.page_table = .init(allocator);
-        proc.page_table.mapKernelPages(allocator);
-        proc.page_table.mapPage(allocator, virtio.blk_paddr, virtio.blk_paddr, .rw);
-        proc.page_table.mapUserImage(allocator, bin_image);
+        proc.page_table = .init(pa);
+        proc.page_table.mapKernelPages(pa);
+        proc.page_table.mapPage(pa, virtio.blk_paddr, virtio.blk_paddr, .rw);
+        proc.page_table.mapUserImage(pa, bin_image);
 
         const stack: []u32 = @ptrCast(&proc.stack);
         @memset(stack[stack.len - 12 ..], 0); // init s0...s11;
@@ -308,7 +327,7 @@ fn yield() void {
         \\mv a1, %[next_sp]
         \\jal %[switchContext]
         :
-        : [satp] "r" (PageTable.satp_sv32 | (@intFromPtr(next.page_table.table1) / PageTable.page_size)),
+        : [satp] "r" (PageTable.satp_sv32 | (@intFromPtr(next.page_table.table1) / page_size)),
           [sscratch] "r" (@intFromPtr(&next.stack) + next.stack.len),
           [prev_sp] "r" (&prev.sp),
           [next_sp] "r" (&next.sp),
@@ -356,8 +375,9 @@ fn switchContext() callconv(.naked) void {
 
 const PageTable = struct {
     table1: [*]Page,
-    const page_size = 4096;
+
     const satp_sv32 = 1 << 31;
+
     const Page = packed struct(u32) {
         flags: Flags,
         page_num: u22,
@@ -376,41 +396,41 @@ const PageTable = struct {
         const urwx: Flags = .{ .user = true, .read = true, .write = true, .execute = true };
     };
 
-    fn init(allocator: std.mem.Allocator) PageTable {
-        const table = allocator.alignedAlloc(Page, .fromByteUnits(page_size), page_size / 4) catch @panic("OOM");
+    fn init(pa: *PageAllocator) PageTable {
+        const table: []Page = @ptrCast(pa.allocPages(1));
         for (table) |*p| p.flags = .{ .valid = false };
         return .{ .table1 = table.ptr };
     }
-    fn mapKernelPages(pt: PageTable, allocator: std.mem.Allocator) void {
+    fn mapKernelPages(pt: PageTable, pa: *PageAllocator) void {
         var paddr = @intFromPtr(&__kernel_base);
         while (paddr < @intFromPtr(&__free_ram_end)) : (paddr += page_size) {
-            pt.mapPage(allocator, paddr, paddr, .rwx);
+            pt.mapPage(pa, paddr, paddr, .rwx);
         }
     }
 
     const user_bin_base = 0x1000000;
 
-    fn mapUserImage(pt: PageTable, allocator: std.mem.Allocator, image: []const u8) void {
+    fn mapUserImage(pt: PageTable, pa: *PageAllocator, image: []const u8) void {
         var off: usize = 0;
         while (off < image.len) : (off += page_size) {
-            const page = allocator.alignedAlloc(u8, .fromByteUnits(page_size), page_size) catch @panic("OOM");
-
+            const page = pa.allocPages(1);
             const to_copy = image[off..][0..@min(page_size, image.len - off)];
             @memcpy(page[0..to_copy.len], to_copy);
 
-            pt.mapPage(allocator, user_bin_base + off, @intFromPtr(page.ptr), .urwx);
+            pt.mapPage(pa, user_bin_base + off, @intFromPtr(page.ptr), .urwx);
         }
     }
 
-    fn mapPage(pt: PageTable, allocator: std.mem.Allocator, vaddr: usize, paddr: usize, flags: Flags) void {
+    fn mapPage(pt: PageTable, pa: *PageAllocator, vaddr: usize, paddr: usize, flags: Flags) void {
         if (!std.mem.isAligned(vaddr, page_size)) std.debug.panic("unaligned vaddr {x}", .{vaddr});
         if (!std.mem.isAligned(paddr, page_size)) std.debug.panic("unaligned paddr {x}", .{paddr});
 
         const vpn1 = (vaddr >> 22) & 0b11111_11111;
         if (!pt.table1[vpn1].flags.valid) {
-            const pt_paddr = (allocator.alignedAlloc(u8, .fromByteUnits(page_size), page_size) catch @panic("OOM")).ptr;
+            const pt_paddr_slice = pa.allocPages(1);
+            @memset(pt_paddr_slice, 0);
             pt.table1[vpn1].flags = .{ .valid = true };
-            pt.table1[vpn1].page_num = @intCast(@intFromPtr(pt_paddr) / page_size);
+            pt.table1[vpn1].page_num = @intCast(@intFromPtr(pt_paddr_slice.ptr) / page_size);
         }
         const vpn0 = (vaddr >> 12) & 0b11111_11111;
         const table0: [*]Page = @ptrFromInt(@as(usize, pt.table1[vpn1].page_num) * page_size);
@@ -531,7 +551,7 @@ const virtio = struct {
             status: u8 align(1),
         };
 
-        pub fn init(allocator: std.mem.Allocator) !Blk {
+        pub fn init(pa: *PageAllocator) !Blk {
             if (reg.magic.* != 0x74726976) return error.InvalidMagic;
             if (reg.version.* != 1) return error.InvalidVersion;
             if (reg.device_id.* != device_blk) return error.InvalidId;
@@ -541,16 +561,14 @@ const virtio = struct {
             reg.device_status.set(.driver);
             reg.device_status.set(.feat_ok); //skip negotiation of features
 
-            const vq: *Virtqueue = .init(allocator, 0);
+            const vq: *Virtqueue = .init(pa, 0);
 
             reg.device_status.* = .{ .driver_ok = true };
 
             const capacity = sector_size * reg.device_config.*;
             print("virtio-blk: capacity is {} bytes\n", .{capacity});
 
-            const alignment: std.mem.Alignment = comptime .fromByteUnits(PageTable.page_size);
-            const num_bytes = alignment.forward(@sizeOf(Request));
-            const paddr_slice = allocator.alignedAlloc(u8, alignment, num_bytes) catch @panic("OOM");
+            const paddr_slice = pa.allocPages((@sizeOf(Request) / page_size) + 1);
             const paddr = @intFromPtr(paddr_slice.ptr);
             @memset(paddr_slice, 0); // init req to all 0
 
@@ -637,7 +655,7 @@ const virtio = struct {
     const Virtqueue = extern struct {
         descs: [entry_num]Descriptor align(1),
         avail: AvailRing align(1),
-        used: UsedRing align(PageTable.page_size),
+        used: UsedRing align(page_size),
         queue_index: u32 align(1),
         used_index: *volatile u16 align(1),
         last_used_index: u16 align(1),
@@ -679,10 +697,8 @@ const virtio = struct {
             };
         };
 
-        pub fn init(allocator: std.mem.Allocator, index: u32) *Virtqueue {
-            const alignment: std.mem.Alignment = comptime .fromByteUnits(PageTable.page_size);
-            const num_bytes = alignment.forward(@sizeOf(Virtqueue));
-            const paddr_slice = allocator.alignedAlloc(u8, alignment, num_bytes) catch @panic("OOM");
+        pub fn init(pa: *PageAllocator, index: u32) *Virtqueue {
+            const paddr_slice = pa.allocPages((@sizeOf(Virtqueue) / page_size) + 1);
             const paddr = @intFromPtr(paddr_slice.ptr);
             const vq: *Virtqueue = @ptrCast(paddr_slice.ptr);
             @memset(paddr_slice, 0); // initialize entire vq to 0
