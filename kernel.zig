@@ -700,8 +700,8 @@ const virtio = struct {
         pub fn kick(vq: *Virtqueue, desc_index: u16) void {
             vq.avail.ring[vq.avail.index % entry_num] = desc_index;
             vq.avail.index +%= 1;
-            // __sync_syncronize() was here in the book, don't know why
-            // this might be the same?
+            // __sync_syncronize() was here in the book
+            // make sure device sees the same data in vq as driver??
             asm volatile ("fence" ::: .{ .memory = true });
             reg.queue_notify.* = vq.queue_index;
             vq.last_used_index +%= 1;
