@@ -24,6 +24,8 @@ pub const sys = struct {
         putc = 0,
         getc = 1,
         exit = 2,
+        read_file = 3,
+        write_file = 4,
     };
     pub fn syscall(num: SysNum, arg0: usize, arg1: usize, arg2: usize) isize {
         return asm volatile ("ecall"
@@ -45,6 +47,17 @@ pub const sys = struct {
         _ = syscall(.exit, 0, 0, 0);
         while (true) {} // should not be reached
     }
+    pub fn readFile(filename: [*:0]const u8, buf: []u8) isize {
+        return syscall(.read_file, @intFromPtr(filename), @intFromPtr(buf.ptr), buf.len);
+    }
+    pub fn writeFile(filename: [*:0]const u8, data: []const u8) isize {
+        return syscall(.write_file, @intFromPtr(filename), @intFromPtr(data.ptr), data.len);
+    }
+};
+
+pub const fs = struct {
+    pub const readFile = sys.readFile;
+    pub const writeFile = sys.writeFile;
 };
 
 pub const console = struct {

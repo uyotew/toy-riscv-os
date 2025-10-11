@@ -14,7 +14,12 @@ var processes: [8]Process = .{Process{}} ** 8;
 var current_proc: *Process = undefined;
 var idle_proc: *Process = undefined;
 
+// global so trapHandler can access them
+var virt_blk: virtio.Blk = undefined;
+var fs: TarFileSystem = undefined;
+
 const page_size = 4096;
+const sector_size = 512;
 
 export fn boot() linksection(".text.boot") callconv(.naked) noreturn {
     asm volatile (
@@ -37,16 +42,10 @@ pub fn main() void {
     const free_ram = @as([*]u8, @ptrCast(&__free_ram))[0..free_ram_len];
     var page_allocator: PageAllocator = .init(@alignCast(free_ram));
 
-    const blk = virtio.Blk.init(&page_allocator) catch |err|
+    virt_blk = virtio.Blk.init(&page_allocator) catch |err|
         std.debug.panic("Blk.init error: {t}", .{err});
 
-    var buf: [virtio.sector_size]u8 = undefined;
-    blk.readSector(&buf, 0);
-    print("sector 0 original content: '{s}'\n", .{buf});
-    const new_start = "wrote this...";
-    @memcpy(buf[0..new_start.len], new_start);
-    blk.writeSector(&buf, 0);
-    print("sector 0 new content: '{s}'\n", .{buf});
+    fs = .init(&page_allocator, virt_blk);
 
     idle_proc = .create(&page_allocator, &.{});
     idle_proc.pid = 0;
@@ -229,6 +228,32 @@ fn handleTrap(tf: *TrapFrame) callconv(.c) void {
                 yield();
                 std.debug.panic("failed to exit from process {}", .{current_proc.pid});
             },
+            .read_file, .write_file => blk: {
+                const filename = std.mem.sliceTo(@as([*:0]u8, @ptrFromInt(tf.a0)), 0);
+                const buf: []u8 = @as([*]u8, @ptrFromInt(tf.a1))[0..tf.a2];
+                const file = for (fs.files) |*f| {
+                    if (std.mem.eql(u8, filename, std.mem.sliceTo(&f.name, 0))) break f;
+                } else {
+                    print("file not found: {s}\n", .{filename});
+                    tf.a0 = @bitCast(@as(isize, -1));
+                    break :blk;
+                };
+                switch (num) {
+                    .read_file => {
+                        const len = @min(buf.len, file.size);
+                        @memcpy(buf[0..len], file.data[0..len]);
+                        tf.a0 = len;
+                    },
+                    .write_file => {
+                        const len = @min(buf.len, file.data.len);
+                        @memcpy(file.data[0..len], buf[0..len]);
+                        file.size = len;
+                        fs.flush(virt_blk);
+                        tf.a0 = len;
+                    },
+                    else => unreachable,
+                }
+            },
         }
         // move to after ecall instruction in user bin
         writeCsr("sepc", user_pc + 4);
@@ -296,13 +321,14 @@ const Process = struct {
 
 fn userEntry() callconv(.naked) void {
     const SPIE = 1 << 5; // something to do with interrupts (won't be used though)
+    const SUM = 1 << 18; // let kernel access user memory
     asm volatile (
         \\csrw sepc, %[sepc]
         \\csrw sstatus, %[sstatus]
         \\sret
         :
         : [sepc] "r" (PageTable.user_bin_base),
-          [sstatus] "r" (SPIE),
+          [sstatus] "r" (SPIE | SUM),
     );
 }
 
@@ -533,7 +559,6 @@ const sbi = struct {
 };
 
 const virtio = struct {
-    const sector_size = 512;
     const device_blk = 2;
     const blk_paddr = 0x10001000;
 
@@ -726,4 +751,106 @@ const virtio = struct {
             return vq.last_used_index != vq.used_index.*;
         }
     };
+};
+
+const TarFileSystem = struct {
+    files: *[max_files]File,
+    disk: *[max_disk_size]u8,
+
+    const max_files = 2;
+    const max_disk_size = std.mem.alignForward(usize, @sizeOf(File) * max_files, sector_size);
+
+    const Header = extern struct {
+        name: [100]u8 align(1),
+        mode: [8]u8 align(1),
+        uid: [8]u8 align(1),
+        gid: [8]u8 align(1),
+        size: [12]u8 align(1),
+        mtime: [12]u8 align(1),
+        checksum: [8]u8 align(1),
+        type: u8 align(1),
+        linkname: [100]u8 align(1),
+        magic: [6]u8 align(1),
+        version: [2]u8 align(1),
+        uname: [32]u8 align(1),
+        gname: [32]u8 align(1),
+        devmajor: [8]u8 align(1),
+        devminor: [8]u8 align(1),
+        prefix: [155]u8 align(1),
+        padding: [12]u8 align(1),
+
+        fn data(h: *Header) []const u8 {
+            const len = std.fmt.parseInt(usize, std.mem.sliceTo(&h.size, 0), 8) catch unreachable;
+            const ptr: [*]u8 = @ptrCast(h);
+            return ptr[@sizeOf(Header)..][0..len];
+        }
+    };
+
+    const File = struct {
+        in_use: bool,
+        name: [100]u8,
+        data: [1024]u8,
+        size: usize,
+    };
+
+    pub fn init(pa: *PageAllocator, blk: virtio.Blk) TarFileSystem {
+        const files_mem = pa.allocPages(((@sizeOf(File) * max_files) / page_size) + 1);
+        const files: *[max_files]File = @ptrCast(files_mem);
+
+        const disk_mem = pa.allocPages((max_disk_size / page_size) + 1);
+        @memset(disk_mem, 0);
+        for (0..max_disk_size / sector_size) |i| {
+            blk.readSector(disk_mem[i * sector_size ..][0..sector_size], i);
+        }
+
+        var off: usize = 0;
+        for (files) |*file| {
+            const header: *Header = @ptrCast(@alignCast(disk_mem[off..].ptr));
+            if (header.name[0] == 0) break;
+            if (!std.mem.eql(u8, std.mem.sliceTo(&header.magic, 0), "ustar"))
+                std.debug.panic("tar header magic: expected 'ustar', found '{s}'", .{&header.magic});
+
+            file.in_use = true;
+            file.name = header.name;
+            const data = header.data();
+            file.size = data.len;
+            @memcpy(file.data[0..data.len], data);
+            print("file: {s}, size={}\n", .{ file.name, data.len });
+
+            off += std.mem.alignForward(usize, @sizeOf(Header) + data.len, sector_size);
+        }
+        return .{ .files = files, .disk = disk_mem[0..max_disk_size] };
+    }
+
+    pub fn flush(tfs: TarFileSystem, blk: virtio.Blk) void {
+        @memset(tfs.disk, 0);
+        var off: usize = 0;
+        for (tfs.files) |*file| {
+            if (!file.in_use) continue;
+            const header: *Header = @ptrCast(@alignCast(tfs.disk[off..].ptr));
+
+            @memset(tfs.disk[off..][0..@sizeOf(Header)], 0);
+            header.name = file.name;
+            @memcpy(header.mode[0..6], "000644");
+            @memcpy(header.magic[0..5], "ustar");
+            @memcpy(header.version[0..2], "00");
+            header.type = '0';
+            _ = std.fmt.bufPrint(&header.size, "{o}", .{file.size}) catch unreachable;
+
+            var checksum: usize = ' ' * 8;
+            for (0..@sizeOf(Header)) |i| checksum += tfs.disk[off + i];
+            for (0..6) |i| {
+                header.checksum[5 - i] = @intCast((checksum % 8) + '0');
+                checksum /= 8;
+            }
+            const data_ptr: [*]u8 = @ptrCast(header);
+            @memcpy(data_ptr[@sizeOf(Header)..], file.data[0..file.size]);
+
+            off += std.mem.alignForward(usize, @sizeOf(Header) + file.size, sector_size);
+        }
+        for (0..max_disk_size / sector_size) |i| {
+            blk.writeSector(tfs.disk[i * sector_size ..][0..sector_size], i);
+        }
+        print("wrote {} bytes to disk\n", .{max_disk_size});
+    }
 };

@@ -33,6 +33,12 @@ pub fn main() void {
 
         if (std.mem.eql(u8, buf[0..buf_len], "exit")) {
             usrstd.exit();
+        } else if (std.mem.eql(u8, buf[0..buf_len], "readfile")) {
+            var f_buf: [128]u8 = undefined;
+            const len: usize = @intCast(usrstd.fs.readFile("test", &f_buf));
+            console.print("{s}\n", .{f_buf[0..len]});
+        } else if (std.mem.eql(u8, buf[0..buf_len], "writefile")) {
+            _ = usrstd.fs.writeFile("test", "written with writefile from shell!");
         } else {
             console.print("unknown command: {s}\n", .{buf[0..buf_len]});
         }

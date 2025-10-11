@@ -55,25 +55,36 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&b.addInstallBinFile(shell_bin, "shell.bin").step);
     b.installArtifact(kernel);
 
-    // include timestamp in content of disk-file, so it always gets generated
-    // and a fresh version is put in .zig-cache, (since the kernel modifies the file)
-    const disk_file = b.addWriteFile("disk-file", b.fmt(
-        "this is the content of disk_file at {}",
-        .{std.time.timestamp()},
-    ));
+    const run = b.step("run", "boot the os within qemu");
+
+    const file_system = tarDir(b, b.path("disk"), "fs.tar");
 
     const qemu = b.addSystemCommand(&.{"qemu-system-riscv32"});
     qemu.addArgs(&.{ "-machine", "virt" });
     qemu.addArgs(&.{ "-bios", "default" });
     qemu.addArgs(&.{ "-serial", "mon:stdio" });
-    qemu.addArg("-drive");
-    qemu.addDecoratedDirectoryArg("id=drive0,file=", disk_file.getDirectory(), "/disk-file,format=raw,if=none");
+    qemu.addArgs(&.{ "-drive", b.fmt("id=drive0,file={s},format=raw,if=none", .{b.getInstallPath(.prefix, "fs.tar")}) });
     qemu.addArgs(&.{ "-device", "virtio-blk-device,drive=drive0,bus=virtio-mmio-bus.0" });
     qemu.addArg("-nographic");
     qemu.addArg("--no-reboot");
     qemu.addArg("-kernel");
     qemu.addArtifactArg(kernel);
 
-    const run = b.step("run", "boot the os within qemu");
+    qemu.step.dependOn(&b.addInstallFile(file_system, "fs.tar").step);
+
     run.dependOn(&qemu.step);
+}
+
+fn tarDir(b: *std.Build, dir: std.Build.LazyPath, name: []const u8) std.Build.LazyPath {
+    const list_disk_files = b.addSystemCommand(&.{ "ls", "--zero" });
+    list_disk_files.addDirectoryArg(dir);
+    const disk_files = list_disk_files.captureStdOut();
+
+    const tar_disk = b.addSystemCommand(&.{ "tar", "cfv" });
+    tar_disk.setCwd(dir);
+    const file_system = tar_disk.addOutputFileArg(name);
+    tar_disk.addArgs(&.{ "--format=ustar", "--null", "-T" });
+    tar_disk.addFileArg(disk_files);
+
+    return file_system;
 }
